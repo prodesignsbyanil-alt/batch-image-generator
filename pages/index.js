@@ -85,7 +85,10 @@ export default function Home() {
   const saveKeys = () => {
     if (typeof window !== "undefined") {
       window.localStorage.setItem("batch_gemini_keys", JSON.stringify(apiKeys));
-      window.localStorage.setItem("batch_gemini_key_index", String(activeKeyIndex));
+      window.localStorage.setItem(
+        "batch_gemini_key_index",
+        String(activeKeyIndex)
+      );
     }
     setStatusMessage("API keys এই ব্রাউজারের localStorage এ সেভ হয়েছে।");
     setTimeout(() => setStatusMessage(""), 3000);
@@ -118,29 +121,18 @@ export default function Home() {
     setStatusMessage("");
   };
 
-  const getNextApiKey = () => {
-    const valid = apiKeys
-      .map((k, idx) => ({ k: k.trim(), idx }))
-      .filter((x) => x.k.length > 0);
-
-    if (!valid.length) return null;
-
-    const currentPos = valid.findIndex((v) => v.idx === activeKeyIndex);
-    const start = currentPos >= 0 ? currentPos : 0;
-    const nextEntry = valid[(start + 1) % valid.length];
-
-    setActiveKeyIndex(nextEntry.idx);
-    return nextEntry.k;
-  };
-
+  // 🔥 নতুন সংস্করণ: এক prompt-এর জন্য সব valid key এক এক করে চেষ্টা করবে
   const handleStart = async () => {
     if (!items.length) {
       setStatusMessage("প্রথমে কিছু prompt লোড করুন।");
       return;
     }
 
-    const anyKey = apiKeys.some((k) => k.trim().length > 0);
-    if (!anyKey) {
+    const validKeys = apiKeys
+      .map((k, idx) => ({ key: k.trim(), idx }))
+      .filter((x) => x.key.length > 0);
+
+    if (!validKeys.length) {
       setStatusMessage("কমপক্ষে একটি Gemini API key দিন।");
       return;
     }
@@ -159,43 +151,63 @@ export default function Home() {
       const baseName = slugify(prompt);
       const fileName = `${String(i + 1).padStart(3, "0")}-${baseName}.png`;
 
-      try {
-        const key = getNextApiKey();
-        if (!key) {
-          throw new Error("কোনো বৈধ Gemini key পাওয়া যায়নি।");
+      let success = false;
+      let lastError = null;
+
+      // এই লুপের ভেতরে সব key একটার পর একটা চেষ্টা হবে
+      for (let j = 0; j < validKeys.length; j++) {
+        const { key, idx } = validKeys[j];
+
+        // UI তে দেখানোর জন্য কোন key এখন ব্যবহার হচ্ছে
+        setActiveKeyIndex(idx);
+
+        try {
+          const resp = await fetch("/api/generate-image", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              prompt,
+              apiKey: key,
+            }),
+          });
+
+          if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            lastError = new Error(errData.error || "API request failed.");
+            // এই key fail, পরের key চেষ্টা করবো
+            continue;
+          }
+
+          const data = await resp.json();
+          const imageBase64 = data.imageBase64;
+          const finalName = data.fileName || fileName;
+
+          if (!imageBase64) {
+            lastError = new Error("No image data returned.");
+            continue;
+          }
+
+          // সফল হলে
+          all[i].status = "done";
+          all[i].imageUrl = `data:image/png;base64,${imageBase64}`;
+          all[i].fileName = finalName;
+          all[i].error = null;
+          success = true;
+          break; // এই prompt-এর জন্য আর key লাগবে না
+        } catch (err) {
+          lastError = err;
+          // নেটওয়ার্ক / অন্য error, পরের key চেষ্টা করবো
+          continue;
         }
+      }
 
-        const resp = await fetch("/api/generate-image", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            prompt,
-            apiKey: key,
-          }),
-        });
-
-        if (!resp.ok) {
-          const errData = await resp.json().catch(() => ({}));
-          throw new Error(errData.error || "API request failed.");
-        }
-
-        const data = await resp.json();
-        const imageBase64 = data.imageBase64;
-        const finalName = data.fileName || fileName;
-
-        if (!imageBase64) {
-          throw new Error("No image data returned.");
-        }
-
-        all[i].status = "done";
-        all[i].imageUrl = `data:image/png;base64,${imageBase64}`;
-        all[i].fileName = finalName;
-        all[i].error = null;
-      } catch (err) {
+      if (!success) {
         all[i].status = "error";
-        all[i].error = err.message || String(err);
+        all[i].error =
+          (lastError && lastError.message) ||
+          "সব API key ব্যর্থ হয়েছে (quota বা অন্য কোনো সমস্যা)।";
       }
 
       setItems([...all]);
@@ -228,7 +240,8 @@ export default function Home() {
             </button>
           </div>
           <div className="login-footer">
-            ইমেইল কেবল এই ব্রাউজারের localStorage এ সেভ হয়, অন্য কোথাও পাঠানো হয় না।
+            ইমেইল কেবল এই ব্রাউজারের localStorage এ সেভ হয়, অন্য কোথাও পাঠানো
+            হয় না।
           </div>
         </div>
       </div>
@@ -323,9 +336,7 @@ export default function Home() {
               <div>
                 Status:{" "}
                 <span
-                  className={
-                    "status-pill " + (isRunning ? "running" : "")
-                  }
+                  className={"status-pill " + (isRunning ? "running" : "")}
                 >
                   {isRunning ? "Running..." : "Idle"}
                 </span>
@@ -367,9 +378,7 @@ export default function Home() {
                       className="api-input"
                       type={visibleKeys[idx] ? "text" : "password"}
                       value={val}
-                      onChange={(e) =>
-                        handleApiKeyChange(idx, e.target.value)
-                      }
+                      onChange={(e) => handleApiKeyChange(idx, e.target.value)}
                       placeholder="GEMINI_API_KEY"
                     />
                     <button
@@ -434,7 +443,9 @@ export default function Home() {
                 </div>
                 <div className="preview-prompt">{item.prompt}</div>
                 {item.error && (
-                  <div style={{ fontSize: 11, color: "#fecaca", marginTop: 4 }}>
+                  <div
+                    style={{ fontSize: 11, color: "#fecaca", marginTop: 4 }}
+                  >
                     Error: {item.error}
                   </div>
                 )}
@@ -453,7 +464,9 @@ export default function Home() {
                       >
                         Download
                       </a>
-                      <span>ব্রাউজার যে ডাউনলোড ফোল্ডার দেখায় সেখানে সেভ হবে।</span>
+                      <span>
+                        ব্রাউজার যে ডাউনলোড ফোল্ডার দেখায় সেখানে সেভ হবে।
+                      </span>
                     </div>
                   </div>
                 )}
